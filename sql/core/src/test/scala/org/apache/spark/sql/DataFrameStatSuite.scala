@@ -21,9 +21,11 @@ import java.util.Random
 
 import org.scalatest.Matchers._
 
+import org.apache.spark.internal.Logging
+import org.apache.spark.sql.execution.stat.StatFunctions
 import org.apache.spark.sql.functions.col
 import org.apache.spark.sql.test.SharedSQLContext
-import org.apache.spark.sql.types.DoubleType
+import org.apache.spark.sql.types.{DoubleType, StructField, StructType}
 
 class DataFrameStatSuite extends QueryTest with SharedSQLContext {
   import testImplicits._
@@ -55,7 +57,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
       val splits = data.randomSplit(Array[Double](1, 2, 3), seed)
       assert(splits.length == 3, "wrong number of splits")
 
-      assert(splits.reduce((a, b) => a.unionAll(b)).sort("id").collect().toList ==
+      assert(splits.reduce((a, b) => a.union(b)).sort("id").collect().toList ==
         data.collect().toList, "incomplete or wrong split")
 
       val s = splits.map(_.count())
@@ -78,7 +80,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     // Verify that the splits span the entire dataset
     assert(splits.flatMap(_.collect()).toSet == data.collect().toSet)
 
-    // Verify that the splits don't overalap
+    // Verify that the splits don't overlap
     assert(splits(0).intersect(splits(1)).collect().isEmpty)
 
     // Verify that the results are deterministic across multiple runs
@@ -121,6 +123,111 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     val decimalData = Seq.tabulate(6)(i => (BigDecimal(i % 3), BigDecimal(i % 2))).toDF("a", "b")
     val decimalRes = decimalData.stat.cov("a", "b")
     assert(math.abs(decimalRes) < 1e-12)
+  }
+
+  test("approximate quantile") {
+    val n = 1000
+    val df = Seq.tabulate(n)(i => (i, 2.0 * i)).toDF("singles", "doubles")
+
+    val q1 = 0.5
+    val q2 = 0.8
+    val epsilons = List(0.1, 0.05, 0.001)
+
+    for (epsilon <- epsilons) {
+      val Array(single1) = df.stat.approxQuantile("singles", Array(q1), epsilon)
+      val Array(double2) = df.stat.approxQuantile("doubles", Array(q2), epsilon)
+      // Also make sure there is no regression by computing multiple quantiles at once.
+      val Array(d1, d2) = df.stat.approxQuantile("doubles", Array(q1, q2), epsilon)
+      val Array(s1, s2) = df.stat.approxQuantile("singles", Array(q1, q2), epsilon)
+
+      val error_single = 2 * 1000 * epsilon
+      val error_double = 2 * 2000 * epsilon
+
+      assert(math.abs(single1 - q1 * n) < error_single)
+      assert(math.abs(double2 - 2 * q2 * n) < error_double)
+      assert(math.abs(s1 - q1 * n) < error_single)
+      assert(math.abs(s2 - q2 * n) < error_single)
+      assert(math.abs(d1 - 2 * q1 * n) < error_double)
+      assert(math.abs(d2 - 2 * q2 * n) < error_double)
+
+      // Multiple columns
+      val Array(Array(ms1, ms2), Array(md1, md2)) =
+        df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), epsilon)
+
+      assert(math.abs(ms1 - q1 * n) < error_single)
+      assert(math.abs(ms2 - q2 * n) < error_single)
+      assert(math.abs(md1 - 2 * q1 * n) < error_double)
+      assert(math.abs(md2 - 2 * q2 * n) < error_double)
+    }
+
+    // quantile should be in the range [0.0, 1.0]
+    val e = intercept[IllegalArgumentException] {
+      df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2, -0.1), epsilons.head)
+    }
+    assert(e.getMessage.contains("quantile should be in the range [0.0, 1.0]"))
+
+    // relativeError should be non-negative
+    val e2 = intercept[IllegalArgumentException] {
+      df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), -1.0)
+    }
+    assert(e2.getMessage.contains("Relative Error must be non-negative"))
+
+    // return null if the dataset is empty
+    val res1 = df.selectExpr("*").limit(0)
+      .stat.approxQuantile("singles", Array(q1, q2), epsilons.head)
+    assert(res1 === null)
+
+    val res2 = df.selectExpr("*").limit(0)
+      .stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), epsilons.head)
+    assert(res2 === null)
+  }
+
+  test("approximate quantile 2: test relativeError greater than 1 return the same result as 1") {
+    val n = 1000
+    val df = Seq.tabulate(n)(i => (i, 2.0 * i)).toDF("singles", "doubles")
+
+    val q1 = 0.5
+    val q2 = 0.8
+    val epsilons = List(2.0, 5.0, 100.0)
+
+    val Array(single1_1) = df.stat.approxQuantile("singles", Array(q1), 1.0)
+    val Array(s1_1, s2_1) = df.stat.approxQuantile("singles", Array(q1, q2), 1.0)
+    val Array(Array(ms1_1, ms2_1), Array(md1_1, md2_1)) =
+      df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), 1.0)
+
+    for (epsilon <- epsilons) {
+      val Array(single1) = df.stat.approxQuantile("singles", Array(q1), epsilon)
+      val Array(s1, s2) = df.stat.approxQuantile("singles", Array(q1, q2), epsilon)
+      val Array(Array(ms1, ms2), Array(md1, md2)) =
+        df.stat.approxQuantile(Array("singles", "doubles"), Array(q1, q2), epsilon)
+      assert(single1_1 === single1)
+      assert(s1_1 === s1)
+      assert(s2_1 === s2)
+      assert(ms1_1 === ms1)
+      assert(ms2_1 === ms2)
+      assert(md1_1 === md1)
+      assert(md2_1 === md2)
+    }
+  }
+
+  test("approximate quantile 3: test on NaN and null values") {
+    val q1 = 0.5
+    val q2 = 0.8
+    val epsilon = 0.1
+    val rows = spark.sparkContext.parallelize(Seq(Row(Double.NaN, 1.0), Row(1.0, 1.0),
+      Row(-1.0, Double.NaN), Row(Double.NaN, Double.NaN), Row(null, null), Row(null, 1.0),
+      Row(-1.0, null), Row(Double.NaN, null)))
+    val schema = StructType(Seq(StructField("input1", DoubleType, nullable = true),
+      StructField("input2", DoubleType, nullable = true)))
+    val dfNaN = spark.createDataFrame(rows, schema)
+    val resNaN = dfNaN.stat.approxQuantile("input1", Array(q1, q2), epsilon)
+    assert(resNaN.count(_.isNaN) === 0)
+    assert(resNaN.count(_ == null) === 0)
+
+    val resNaN2 = dfNaN.stat.approxQuantile(Array("input1", "input2"),
+      Array(q1, q2), epsilon)
+    assert(resNaN2.flatten.count(_.isNaN) === 0)
+    assert(resNaN2.flatten.count(_ == null) === 0)
   }
 
   test("crosstab") {
@@ -206,8 +313,19 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(items.length === 1)
   }
 
+  test("SPARK-15709: Prevent `UnsupportedOperationException: empty.min` in `freqItems`") {
+    val ds = spark.createDataset(Seq(1, 2, 2, 3, 3, 3))
+
+    intercept[IllegalArgumentException] {
+      ds.stat.freqItems(Seq("value"), 0)
+    }
+    intercept[IllegalArgumentException] {
+      ds.stat.freqItems(Seq("value"), 2)
+    }
+  }
+
   test("sampleBy") {
-    val df = sqlContext.range(0, 100).select((col("id") % 3).as("key"))
+    val df = spark.range(0, 100).select((col("id") % 3).as("key"))
     val sampled = df.stat.sampleBy("key", Map(0 -> 0.1, 1 -> 0.2), 0L)
     checkAnswer(
       sampled.groupBy("key").count().orderBy("key"),
@@ -218,7 +336,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
   // `CountMinSketch`es that meet required specs.  Test cases for `CountMinSketch` can be found in
   // `CountMinSketchSuite` in project spark-sketch.
   test("countMinSketch") {
-    val df = sqlContext.range(1000)
+    val df = spark.range(1000)
 
     val sketch1 = df.stat.countMinSketch("id", depth = 10, width = 20, seed = 42)
     assert(sketch1.totalCount() === 1000)
@@ -250,7 +368,7 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
   // This test only verifies some basic requirements, more correctness tests can be found in
   // `BloomFilterSuite` in project spark-sketch.
   test("Bloom filter") {
-    val df = sqlContext.range(1000)
+    val df = spark.range(1000)
 
     val filter1 = df.stat.bloomFilter("id", 1000, 0.03)
     assert(filter1.expectedFpp() - 0.03 < 1e-3)
@@ -268,4 +386,41 @@ class DataFrameStatSuite extends QueryTest with SharedSQLContext {
     assert(filter4.bitSize() == 64 * 5)
     assert(0.until(1000).forall(i => filter4.mightContain(i * 3)))
   }
+}
+
+
+class DataFrameStatPerfSuite extends QueryTest with SharedSQLContext with Logging {
+
+  // Turn on this test if you want to test the performance of approximate quantiles.
+  ignore("computing quantiles should not take much longer than describe()") {
+    val df = spark.range(5000000L).toDF("col1").cache()
+    def seconds(f: => Any): Double = {
+      // Do some warmup
+      logDebug("warmup...")
+      for (i <- 1 to 10) {
+        df.count()
+        f
+      }
+      logDebug("execute...")
+      // Do it 10 times and report median
+      val times = (1 to 10).map { i =>
+        val start = System.nanoTime()
+        f
+        val end = System.nanoTime()
+        (end - start) / 1e9
+      }
+      logDebug("execute done")
+      times.sum / times.length.toDouble
+    }
+
+    logDebug("*** Normal describe ***")
+    val t1 = seconds { df.describe() }
+    logDebug(s"T1 = $t1")
+    logDebug("*** Just quantiles ***")
+    val t2 = seconds {
+      StatFunctions.multipleApproxQuantiles(df, Seq("col1"), Seq(0.1, 0.25, 0.5, 0.75, 0.9), 0.01)
+    }
+    logDebug(s"T1 = $t1, T2 = $t2")
+  }
+
 }

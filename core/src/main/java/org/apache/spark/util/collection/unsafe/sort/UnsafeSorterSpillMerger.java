@@ -26,26 +26,22 @@ final class UnsafeSorterSpillMerger {
   private int numRecords = 0;
   private final PriorityQueue<UnsafeSorterIterator> priorityQueue;
 
-  public UnsafeSorterSpillMerger(
-      final RecordComparator recordComparator,
-      final PrefixComparator prefixComparator,
-      final int numSpills) {
-    final Comparator<UnsafeSorterIterator> comparator = new Comparator<UnsafeSorterIterator>() {
-
-      @Override
-      public int compare(UnsafeSorterIterator left, UnsafeSorterIterator right) {
-        final int prefixComparisonResult =
-          prefixComparator.compare(left.getKeyPrefix(), right.getKeyPrefix());
-        if (prefixComparisonResult == 0) {
-          return recordComparator.compare(
-            left.getBaseObject(), left.getBaseOffset(),
-            right.getBaseObject(), right.getBaseOffset());
-        } else {
-          return prefixComparisonResult;
-        }
+  UnsafeSorterSpillMerger(
+      RecordComparator recordComparator,
+      PrefixComparator prefixComparator,
+      int numSpills) {
+    Comparator<UnsafeSorterIterator> comparator = (left, right) -> {
+      int prefixComparisonResult =
+        prefixComparator.compare(left.getKeyPrefix(), right.getKeyPrefix());
+      if (prefixComparisonResult == 0) {
+        return recordComparator.compare(
+          left.getBaseObject(), left.getBaseOffset(),
+          right.getBaseObject(), right.getBaseOffset());
+      } else {
+        return prefixComparisonResult;
       }
     };
-    priorityQueue = new PriorityQueue<UnsafeSorterIterator>(numSpills, comparator);
+    priorityQueue = new PriorityQueue<>(numSpills, comparator);
   }
 
   /**
@@ -57,7 +53,7 @@ final class UnsafeSorterSpillMerger {
       // make sure the hasNext method of UnsafeSorterIterator returned by getSortedIterator
       // does not return wrong result because hasNext will returns true
       // at least priorityQueue.size() times. If we allow n spillReaders in the
-      // priorityQueue, we will have n extra empty records in the result of the UnsafeSorterIterator.
+      // priorityQueue, we will have n extra empty records in the result of UnsafeSorterIterator.
       spillReader.loadNext();
       priorityQueue.add(spillReader);
       numRecords += spillReader.getNumRecords();

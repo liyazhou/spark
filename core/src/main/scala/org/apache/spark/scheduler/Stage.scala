@@ -19,7 +19,8 @@ package org.apache.spark.scheduler
 
 import scala.collection.mutable.HashSet
 
-import org.apache.spark._
+import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
 import org.apache.spark.util.CallSite
 
@@ -66,32 +67,14 @@ private[scheduler] abstract class Stage(
   /** Set of jobs that this stage belongs to. */
   val jobIds = new HashSet[Int]
 
-  val pendingPartitions = new HashSet[Int]
-
   /** The ID to use for the next new attempt for this stage. */
   private var nextAttemptId: Int = 0
 
   val name: String = callSite.shortForm
   val details: String = callSite.longForm
 
-  private var _internalAccumulators: Seq[Accumulator[_]] = Seq.empty
-
-  /** Internal accumulators shared across all tasks in this stage. */
-  def internalAccumulators: Seq[Accumulator[_]] = _internalAccumulators
-
   /**
-   * Re-initialize the internal accumulators associated with this stage.
-   *
-   * This is called every time the stage is submitted, *except* when a subset of tasks
-   * belonging to this stage has already finished. Otherwise, reinitializing the internal
-   * accumulators here again will override partial values from the finished tasks.
-   */
-  def resetInternalAccumulators(): Unit = {
-    _internalAccumulators = InternalAccumulator.create(rdd.sparkContext)
-  }
-
-  /**
-   * Pointer to the [StageInfo] object for the most recent attempt. This needs to be initialized
+   * Pointer to the [[StageInfo]] object for the most recent attempt. This needs to be initialized
    * here, before any attempts have actually been created, because the DAGScheduler uses this
    * StageInfo to tell SparkListeners when a job starts (which happens before any stage attempts
    * have been created).
@@ -125,8 +108,10 @@ private[scheduler] abstract class Stage(
   def makeNewStageAttempt(
       numPartitionsToCompute: Int,
       taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty): Unit = {
+    val metrics = new TaskMetrics
+    metrics.register(rdd.sparkContext)
     _latestInfo = StageInfo.fromStage(
-      this, nextAttemptId, Some(numPartitionsToCompute), taskLocalityPreferences)
+      this, nextAttemptId, Some(numPartitionsToCompute), metrics, taskLocalityPreferences)
     nextAttemptId += 1
   }
 

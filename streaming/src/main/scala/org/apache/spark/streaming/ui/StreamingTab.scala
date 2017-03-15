@@ -17,7 +17,8 @@
 
 package org.apache.spark.streaming.ui
 
-import org.apache.spark.{Logging, SparkException}
+import org.apache.spark.SparkException
+import org.apache.spark.internal.Logging
 import org.apache.spark.streaming.StreamingContext
 import org.apache.spark.ui.{SparkUI, SparkUITab}
 
@@ -37,6 +38,7 @@ private[spark] class StreamingTab(val ssc: StreamingContext)
 
   ssc.addStreamingListener(listener)
   ssc.sc.addSparkListener(listener)
+  parent.setStreamingJobProgressListener(listener)
   attachPage(new StreamingPage(this))
   attachPage(new BatchPage(this))
 
